@@ -1,5 +1,5 @@
 // Package pulse is the official Go client for StreamFlow Pulse — the AI Agent
-// Platform (https://github.com/olsisoft/streamflow).
+// Platform (https://github.com/olsisoft/pulse-go).
 //
 // Quick start:
 //

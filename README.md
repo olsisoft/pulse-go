@@ -1,6 +1,6 @@
 # pulse-go — Go SDK for StreamFlow Pulse
 
-Official Go client for [Pulse](https://github.com/olsisoft/streamflow) — the AI Agent Platform. Targets **Go 1.22+**, **zero external dependencies** (stdlib only: `net/http`, `encoding/json`).
+Official Go client for [Pulse](https://github.com/olsisoft/pulse-go) — the AI Agent Platform. Targets **Go 1.22+**, **zero external dependencies** (stdlib only: `net/http`, `encoding/json`).
 
 ```go
 package main
@@ -194,8 +194,8 @@ client, _ := pulse.NewClient(
 ## Development
 
 ```bash
-git clone https://github.com/olsisoft/streamflow.git
-cd streamflow/pulse-go
+git clone https://github.com/olsisoft/pulse-go.git
+cd pulse-go
 
 go build ./...
 go vet ./...

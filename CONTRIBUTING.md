@@ -1,7 +1,7 @@
 # Contributing to pulse-go
 
 This repository is **a synchronised mirror** of `pulse-go/` in the
-[streamflow monorepo](https://github.com/olsisoft/streamflow).
+[streamflow monorepo](https://github.com/olsisoft/pulse-go).
 
 Open issues + pull requests against the monorepo, not against this
 repo. The sync workflow lifts code from there into here on every
