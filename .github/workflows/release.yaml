@@ -1,0 +1,50 @@
+name: Release Go module
+
+# Lives at .github/workflows/release.yaml in olsisoft/pulse-go.
+# Triggered by tag push (v*). NO publish step — Go modules are distributed
+# via the proxy.golang.org cache, which picks up new tags automatically
+# within minutes. This workflow:
+#   1. Runs tests one last time against the tagged code
+#   2. Warms up the module proxy so the version is immediately available
+#   3. Creates the GitHub Release with auto-generated notes
+#
+# No secrets required (the Go module proxy is public).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # for GitHub Release creation
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Vet + test against the tagged code
+        run: |
+          go vet ./...
+          go test -v -race ./...
+
+      - name: Warm up proxy.golang.org
+        run: |
+          version="${GITHUB_REF_NAME}"
+          GOPROXY=https://proxy.golang.org \
+            go list -m "github.com/${GITHUB_REPOSITORY}@${version}" || \
+            echo "::warning::proxy warmup non-fatal; the proxy will pick up the tag within ~10 min"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Install: `go get github.com/${{ github.repository }}@${{ github.ref_name }}`

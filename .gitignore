@@ -1,0 +1,24 @@
+# Go build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace (rarely committed)
+go.work
+go.work.sum
+
+# Coverage profiles
+coverage.out
+coverage.html
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Vendored deps (we don't vendor — stdlib-only library)
+vendor/
