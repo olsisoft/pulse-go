@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -66,6 +67,7 @@ type Client struct {
 	Events    *EventsService
 	IQ        *IQService
 	Streams   *StreamsService
+	Models    *ModelsService
 }
 
 // Option configures a Client at construction time.
@@ -137,6 +139,7 @@ func NewClient(opts ...Option) (*Client, error) {
 	c.Events = &EventsService{client: c}
 	c.IQ = &IQService{client: c}
 	c.Streams = &StreamsService{client: c}
+	c.Models = &ModelsService{client: c}
 	return c, nil
 }
 
@@ -195,6 +198,77 @@ func (c *Client) request(ctx context.Context, method, path string, body any, aut
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("pulse: HTTP transport failure on %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 204 {
+		return map[string]any{}, nil
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("pulse: failed to read response body from %s: %w", path, err)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if len(bodyBytes) == 0 {
+			return map[string]any{}, nil
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+			return nil, fmt.Errorf("pulse: failed to parse JSON response from %s: %w", path, err)
+		}
+		if parsed == nil {
+			return map[string]any{}, nil
+		}
+		return parsed, nil
+	}
+
+	return nil, translateError(resp, path, bodyBytes)
+}
+
+// requestMultipart POSTs a multipart/form-data body — used by the model-upload
+// endpoint (B-112). fileField is the form field name for the file part,
+// filename the part's filename, fileBytes the raw blob, and formFields the
+// extra text fields. Always authenticated (the upload endpoint requires ADMIN).
+func (c *Client) requestMultipart(ctx context.Context, path, fileField, filename string, fileBytes []byte, formFields map[string]string) (map[string]any, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile(fileField, filename)
+	if err != nil {
+		return nil, fmt.Errorf("pulse: failed to create multipart file part for %s: %w", path, err)
+	}
+	if _, err := part.Write(fileBytes); err != nil {
+		return nil, fmt.Errorf("pulse: failed to write multipart file part for %s: %w", path, err)
+	}
+	for k, v := range formFields {
+		if err := mw.WriteField(k, v); err != nil {
+			return nil, fmt.Errorf("pulse: failed to write multipart field %q for %s: %w", k, path, err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, fmt.Errorf("pulse: failed to finalize multipart body for %s: %w", path, err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, &buf)
+	if err != nil {
+		return nil, fmt.Errorf("pulse: failed to build request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	token := c.Token()
+	if token == "" {
+		errCopy := *errNoToken
+		errCopy.Path = path
+		return nil, &errCopy
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("pulse: HTTP transport failure on %s %s: %w", http.MethodPost, path, err)
 	}
 	defer resp.Body.Close()
 

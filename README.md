@@ -114,6 +114,29 @@ log.Println("created:", newPipeline["id"])
 
 Full ~112-endpoint surface documented in Swagger UI at `<pulse-server>/api-docs`. Less-used methods land opportunistically as user-facing demand surfaces.
 
+## Embedded ML inference & duplex
+
+Score events with an uploaded ONNX model in-process (B-112), and open a
+bidirectional duplex channel for synchronous decisions (B-114). Full guide:
+[ML inference & duplex](https://github.com/olsisoft/pulse-go/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+
+```go
+// Upload + score with an ONNX model (no model-server hop)
+client.Models.Upload(ctx, pulse.UploadModelOptions{
+    Name: "fraud", Path: "./fraud.onnx",
+    InputSchema: map[string]string{"amount": "float", "country": "float"}})
+builder.FromTopic("transactions").
+    MlPredict(pulse.MlPredictOptions{
+        Model: "fraud", InputFields: []string{"amount", "country"}, OutputField: "prediction"}).
+    Filter("prediction.fraud_score > 0.8").ToTopic("flagged")
+
+// Duplex: one connection, send in / receive the correlated output
+ch, _ := client.Duplex(ctx, "fraud-detector")
+defer ch.Close()
+cid, _ := ch.Send(ctx, map[string]any{"amount": 5000}, "tx-1")
+out, _ := ch.Recv(ctx) // out["correlationId"] == "tx-1"
+```
+
 ## Authentication
 
 Three patterns:

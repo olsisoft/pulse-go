@@ -68,6 +68,18 @@ type IQQueryOptions struct {
 	GroupBy    string // empty → flat response; non-empty → grouped response
 }
 
+// IQDiffOptions — the time window for Diff. B-113.
+//
+// Both fields accept the same specs as GetAsOf: "now", a relative offset
+// ("-1h", "-30m", "-7d"), an ISO-8601 instant, or epoch millis. Empty
+// strings fall back to the server defaults (From="-1h", To="now").
+type IQDiffOptions struct {
+	// From — start of the window. Empty → server default "-1h".
+	From string
+	// To — end of the window. Empty → server default "now".
+	To string
+}
+
 // Summary — GET /api/pulse/iq/agents/{id}/state — headline state summary.
 //
 // Returned map always carries the 9 fields: agentId, queryable, backend,
@@ -100,6 +112,66 @@ func (s *IQService) Summary(ctx context.Context, agentID string) (map[string]any
 func (s *IQService) Get(ctx context.Context, agentID, key string) (map[string]any, error) {
 	path := "/api/pulse/iq/agents/" + encodeIQSegment(agentID) +
 		"/state/value/" + encodeIQSegment(key)
+	return s.client.request(ctx, http.MethodGet, path, nil, true)
+}
+
+// GetAsOf — GET /api/pulse/iq/agents/{id}/state/value/{key}?as_of=<spec> —
+// B-113 time-travel point lookup.
+//
+// Reads the value of key as it was at a past instant instead of the live
+// value. asOf accepts the same time specs as the rest of B-113: "now", a
+// relative offset ("-1h", "-30m", "-7d"), an ISO-8601 instant, or epoch
+// millis — the string is passed through to the server unchanged.
+//
+// Returns the IQValue map (agentId, key, value) which additionally carries
+// asOf (the resolved epoch ms). An empty asOf sends no query parameter and
+// is equivalent to Get (the live value).
+//
+// Like Get, raises *NotFoundError when the key is absent or the agent is
+// not queryable — branch on the body to distinguish.
+func (s *IQService) GetAsOf(ctx context.Context, agentID, key, asOf string) (map[string]any, error) {
+	path := "/api/pulse/iq/agents/" + encodeIQSegment(agentID) +
+		"/state/value/" + encodeIQSegment(key)
+	if asOf != "" {
+		q := url.Values{}
+		q.Set("as_of", asOf)
+		path += "?" + q.Encode()
+	}
+	return s.client.request(ctx, http.MethodGet, path, nil, true)
+}
+
+// Diff — GET /api/pulse/iq/agents/{id}/state/diff/{key}?from=&to= — B-113
+// field-level state diff between two instants.
+//
+// Returns the raw response map: agentId, key, fromTs, toTs (resolved epoch
+// ms), and changes — a map from each changed field name to one of:
+//
+//   - {delta, from, to} — value changed (delta present for numeric fields)
+//   - {added}           — field present at "to" but not at "from"
+//   - {removed}         — field present at "from" but not at "to"
+//
+// The from/to specs default to "-1h" / "now" when opts leaves them empty.
+//
+//	d, _ := client.IQ.Diff(ctx, "user-sessions", "u42", IQDiffOptions{From: "-1h", To: "now"})
+//	changes := d["changes"].(map[string]any)
+//	cart := changes["cart_value"].(map[string]any) // {"delta": 70, "from": 0, "to": 70}
+//
+// Like the other state endpoints, raises *NotFoundError when the agent is
+// not queryable.
+func (s *IQService) Diff(ctx context.Context, agentID, key string, opts IQDiffOptions) (map[string]any, error) {
+	from := opts.From
+	if from == "" {
+		from = "-1h"
+	}
+	to := opts.To
+	if to == "" {
+		to = "now"
+	}
+	q := url.Values{}
+	q.Set("from", from)
+	q.Set("to", to)
+	path := "/api/pulse/iq/agents/" + encodeIQSegment(agentID) +
+		"/state/diff/" + encodeIQSegment(key) + "?" + q.Encode()
 	return s.client.request(ctx, http.MethodGet, path, nil, true)
 }
 
@@ -224,7 +296,7 @@ func IQNot(child map[string]any) map[string]any {
 }
 
 // encodeIQSegment percent-encodes a path segment aggressively — same
-// semantics as Python's urllib.quote(safe=''), Java's URLEncoder.encode
+// semantics as Python's urllib.quote(safe=”), Java's URLEncoder.encode
 // followed by '+'→'%20', and JavaScript's encodeURIComponent. This keeps
 // the wire format identical across all 5 Pulse SDKs so a key like
 // "user:123/orders" produces the same URL bytes regardless of caller
