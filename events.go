@@ -7,8 +7,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 )
+
+// EventsReplayOptions — the time window + cap for Events.Replay. B-113.
+//
+// From / To accept the same specs as IQ.GetAsOf ("now", "-1h", an ISO-8601
+// instant, or epoch millis); empty strings fall back to the server defaults
+// (From="-1h", To="now"). Limit caps the number of changes returned; 0 (the
+// zero value) sends the server default of 100.
+type EventsReplayOptions struct {
+	From  string
+	To    string
+	Limit int
+}
 
 // EventsService — client.Events. Live SSE stream of events flowing through
 // the Pulse engine.
@@ -143,4 +157,62 @@ func (s *EventsService) Stream(ctx context.Context) (<-chan map[string]any, <-ch
 	}()
 
 	return events, errCh
+}
+
+// Replay — GET /api/pulse/iq/agents/{affectingState}/state/replay/{key}?from=&to=&limit=
+// — B-113. The ordered changes that touched a state key between two instants.
+//
+// affectingState is the agent whose state store to inspect; key is the state
+// key. The endpoint lives under the IQ state surface (it reads the same
+// change log the time-travel Get/Diff read), so it is exposed here on the
+// Events service to mirror the sibling SDKs' client.events.replay placement.
+//
+// Returns the unwrapped changes slice — each entry carries timestamp,
+// changeType ("PUT" / "DELETE"), the resulting value, and eventId when
+// known. The from/to/limit specs default to "-1h" / "now" / 100 when opts
+// leaves them empty / zero.
+//
+//	changes, _ := client.Events.Replay(ctx, "user-sessions", "u42", EventsReplayOptions{
+//	    From: "2026-05-24T10:00:00Z", To: "2026-05-24T11:00:00Z",
+//	})
+//	for _, ch := range changes {
+//	    fmt.Println(ch["timestamp"], ch["changeType"], ch["value"])
+//	}
+//
+// Raises *NotFoundError when the agent is not queryable.
+func (s *EventsService) Replay(ctx context.Context, affectingState, key string, opts EventsReplayOptions) ([]map[string]any, error) {
+	from := opts.From
+	if from == "" {
+		from = "-1h"
+	}
+	to := opts.To
+	if to == "" {
+		to = "now"
+	}
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	q := url.Values{}
+	q.Set("from", from)
+	q.Set("to", to)
+	q.Set("limit", strconv.Itoa(limit))
+	path := "/api/pulse/iq/agents/" + encodeIQSegment(affectingState) +
+		"/state/replay/" + encodeIQSegment(key) + "?" + q.Encode()
+
+	result, err := s.client.request(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := result["changes"].([]any)
+	if !ok {
+		return []map[string]any{}, nil
+	}
+	changes := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]any); ok {
+			changes = append(changes, m)
+		}
+	}
+	return changes, nil
 }
