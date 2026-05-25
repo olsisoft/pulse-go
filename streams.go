@@ -242,6 +242,51 @@ type CdcJoinOptions struct {
 	StateBackend string
 }
 
+// MapLlmOptions — B-109 options for StreamBuilder.MapLlm. Pointer fields are
+// optional (nil = omit). OutputField is required.
+type MapLlmOptions struct {
+	OutputField    string
+	Model          string
+	Temperature    *float64
+	MaxTokens      *int
+	Parallelism    *int
+	Ordering       string // "PRESERVE_INPUT" | "UNORDERED" | "" (omit)
+	OnFailure      string // "EMIT_ERROR" | "DROP" | "PASS_THROUGH" | "" (omit)
+	MaxCallsPerSec *int
+}
+
+// ExtractOptions — B-109 options for StreamBuilder.Extract. Instruction +
+// Schema are required.
+type ExtractOptions struct {
+	Instruction string
+	Schema      map[string]string
+	Model       string
+	Temperature *float64
+	MaxTokens   *int
+	OnFailure   string
+}
+
+// McpCallOptions — B-109 Phase 2 options for StreamBuilder.McpCall.
+type McpCallOptions struct {
+	Args        map[string]any
+	OutputField string
+	Parallelism *int
+	Ordering    string
+	OnFailure   string
+}
+
+// MlPredictOptions — B-112 options for StreamBuilder.MlPredict. Model,
+// InputFields and OutputField are required. Pointer fields are optional
+// (nil = omit).
+type MlPredictOptions struct {
+	Model       string
+	InputFields []string
+	OutputField string
+	Parallelism *int
+	Ordering    string // "PRESERVE_INPUT" | "UNORDERED" | "" (omit)
+	OnFailure   string // "EMIT_ERROR" | "DROP" | "PASS_THROUGH" | "" (omit)
+}
+
 // ---------------------------------------------------------------------------
 // StreamBuilder — fluent operator-chain → pipeline-JSON compiler.
 // ---------------------------------------------------------------------------
@@ -484,6 +529,154 @@ func (b *StreamBuilder) Cep(sequence []map[string]any, options ...CepOptions) *S
 	return b
 }
 
+// MapLlm — B-109: enrich each event with an LLM completion. prompt supports
+// {field} placeholders (and {__payload__}) substituted from the event
+// server-side; the completion lands on the event under options.OutputField.
+func (b *StreamBuilder) MapLlm(prompt string, options MapLlmOptions) *StreamBuilder {
+	requireNonBlank("prompt", prompt)
+	requireNonBlank("OutputField", options.OutputField)
+	if options.Ordering != "" && options.Ordering != "PRESERVE_INPUT" && options.Ordering != "UNORDERED" {
+		panic(fmt.Sprintf("MapLlm: Ordering must be PRESERVE_INPUT or UNORDERED, got %q", options.Ordering))
+	}
+	checkFailure("MapLlm", options.OnFailure)
+	op := map[string]any{"type": "mapLlm", "prompt": prompt, "outputField": options.OutputField}
+	if options.Model != "" {
+		op["model"] = options.Model
+	}
+	if options.Temperature != nil {
+		op["temperature"] = *options.Temperature
+	}
+	if options.MaxTokens != nil {
+		op["maxTokens"] = *options.MaxTokens
+	}
+	if options.Parallelism != nil {
+		op["parallelism"] = *options.Parallelism
+	}
+	if options.Ordering != "" {
+		op["ordering"] = options.Ordering
+	}
+	if options.OnFailure != "" {
+		op["onFailure"] = options.OnFailure
+	}
+	if options.MaxCallsPerSec != nil {
+		op["maxCallsPerSec"] = *options.MaxCallsPerSec
+	}
+	b.ops = append(b.ops, op)
+	return b
+}
+
+// Extract — B-109: LLM → typed structured fields merged into the event. The
+// LLM is asked for a JSON object keyed by options.Schema's fields; missing /
+// malformed fields become null server-side.
+func (b *StreamBuilder) Extract(options ExtractOptions) *StreamBuilder {
+	requireNonBlank("Instruction", options.Instruction)
+	if len(options.Schema) == 0 {
+		panic("Extract: requires a non-empty Schema")
+	}
+	checkFailure("Extract", options.OnFailure)
+	schema := make(map[string]any, len(options.Schema))
+	for k, v := range options.Schema {
+		schema[k] = v
+	}
+	op := map[string]any{"type": "extract", "instruction": options.Instruction, "schema": schema}
+	if options.Model != "" {
+		op["model"] = options.Model
+	}
+	if options.Temperature != nil {
+		op["temperature"] = *options.Temperature
+	}
+	if options.MaxTokens != nil {
+		op["maxTokens"] = *options.MaxTokens
+	}
+	if options.OnFailure != "" {
+		op["onFailure"] = options.OnFailure
+	}
+	b.ops = append(b.ops, op)
+	return b
+}
+
+// McpCall — B-109 Phase 2: invoke an MCP tool per event. options.Args string
+// values support {field} substitution. On success the tool output is written
+// to options.OutputField (omit for a fire-and-forget side effect).
+func (b *StreamBuilder) McpCall(tool string, options ...McpCallOptions) *StreamBuilder {
+	requireNonBlank("tool", tool)
+	op := map[string]any{"type": "mcpCall", "tool": tool}
+	if len(options) > 0 {
+		opts := options[0]
+		if opts.Ordering != "" && opts.Ordering != "PRESERVE_INPUT" && opts.Ordering != "UNORDERED" {
+			panic(fmt.Sprintf("McpCall: Ordering must be PRESERVE_INPUT or UNORDERED, got %q", opts.Ordering))
+		}
+		checkFailure("McpCall", opts.OnFailure)
+		if opts.Args != nil {
+			args := make(map[string]any, len(opts.Args))
+			for k, v := range opts.Args {
+				args[k] = v
+			}
+			op["args"] = args
+		}
+		if opts.OutputField != "" {
+			op["outputField"] = opts.OutputField
+		}
+		if opts.Parallelism != nil {
+			op["parallelism"] = *opts.Parallelism
+		}
+		if opts.Ordering != "" {
+			op["ordering"] = opts.Ordering
+		}
+		if opts.OnFailure != "" {
+			op["onFailure"] = opts.OnFailure
+		}
+	}
+	b.ops = append(b.ops, op)
+	return b
+}
+
+// MlPredict — B-112: score each event with an embedded ONNX model.
+//
+// Runs an uploaded model in-process on the Pulse engine (no model-server hop).
+// The named options.InputFields are pulled from the event payload (dotted
+// paths like "customer.tier" resolve through nested objects) and fed to the
+// model in order; the model's output is written as a nested object under
+// options.OutputField so downstream operators can branch on it (e.g.
+// .Filter("prediction.fraud_score > 0.8")).
+//
+// Upload the model first with client.Models.Upload(...).
+func (b *StreamBuilder) MlPredict(options MlPredictOptions) *StreamBuilder {
+	requireNonBlank("Model", options.Model)
+	requireNonBlank("OutputField", options.OutputField)
+	if len(options.InputFields) == 0 {
+		panic("MlPredict: InputFields must be a non-empty list of non-blank strings")
+	}
+	for i, f := range options.InputFields {
+		if strings.TrimSpace(f) == "" {
+			panic(fmt.Sprintf("MlPredict: InputFields[%d] must be a non-blank string", i))
+		}
+	}
+	if options.Ordering != "" && options.Ordering != "PRESERVE_INPUT" && options.Ordering != "UNORDERED" {
+		panic(fmt.Sprintf("MlPredict: Ordering must be PRESERVE_INPUT or UNORDERED, got %q", options.Ordering))
+	}
+	checkFailure("MlPredict", options.OnFailure)
+	inputFields := make([]string, len(options.InputFields))
+	copy(inputFields, options.InputFields)
+	op := map[string]any{
+		"type":        "mlPredict",
+		"model":       options.Model,
+		"inputFields": inputFields,
+		"outputField": options.OutputField,
+	}
+	if options.Parallelism != nil {
+		op["parallelism"] = *options.Parallelism
+	}
+	if options.Ordering != "" {
+		op["ordering"] = options.Ordering
+	}
+	if options.OnFailure != "" {
+		op["onFailure"] = options.OnFailure
+	}
+	b.ops = append(b.ops, op)
+	return b
+}
+
 // BroadcastJoin — enrich the stream against a fully-replicated table.
 func (b *StreamBuilder) BroadcastJoin(options BroadcastJoinOptions) *StreamBuilder {
 	requireNonBlank("JoinKeyField", options.JoinKeyField)
@@ -544,6 +737,20 @@ func (b *StreamBuilder) ToTopic(topic string, options ...ToTopicOptions) *Stream
 	b.sinkConfig = copyMap(opts.SinkConfig)
 	b.sinkLabel = opts.Label
 	return b
+}
+
+// ToConnector terminates the stream in a connector sink (Segment, Kafka,
+// Postgres, …) — an ergonomic, connector-first alias for
+// ToTopic(topic, ToTopicOptions{SinkChannel, SinkConfig}). connectorType is a
+// subType from client.Connectors.List(); bridged connectors require the
+// enterprise bridge JAR on the server. The intermediate topic is
+// "<connectorType>-sink-out".
+func (b *StreamBuilder) ToConnector(connectorType string, config map[string]any) *StreamBuilder {
+	requireNonBlank("connectorType", connectorType)
+	return b.ToTopic(connectorType+"-sink-out", ToTopicOptions{
+		SinkChannel: connectorType,
+		SinkConfig:  config,
+	})
 }
 
 // ToState — terminate the stream in the agent's state store (queryable via
@@ -697,6 +904,13 @@ func (b *StreamBuilder) Build(overrideName string) (map[string]any, error) {
 func requireNonBlank(name, value string) {
 	if strings.TrimSpace(value) == "" {
 		panic(fmt.Sprintf("%s must be a non-empty string, got %q", name, value))
+	}
+}
+
+// checkFailure panics if onFailure is set to an invalid value (B-109).
+func checkFailure(op, onFailure string) {
+	if onFailure != "" && onFailure != "EMIT_ERROR" && onFailure != "DROP" && onFailure != "PASS_THROUGH" {
+		panic(fmt.Sprintf("%s: OnFailure must be EMIT_ERROR, DROP or PASS_THROUGH, got %q", op, onFailure))
 	}
 }
 

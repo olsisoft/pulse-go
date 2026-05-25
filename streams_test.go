@@ -359,6 +359,95 @@ func TestStreamBuilder_CepRejectsEmptySequence(t *testing.T) {
 	})
 }
 
+// ---- B-109 map_llm / extract / mcp_call ----
+
+func TestStreamBuilder_MapLlmFullShape(t *testing.T) {
+	temp := 0.0
+	mt, par, mcps := 64, 8, 50
+	b := NewStreamBuilder("").FromTopic("in").MapLlm("Summarise: {body}", MapLlmOptions{
+		OutputField:    "summary",
+		Model:          "gemma3:7b",
+		Temperature:    &temp,
+		MaxTokens:      &mt,
+		Parallelism:    &par,
+		Ordering:       "UNORDERED",
+		OnFailure:      "PASS_THROUGH",
+		MaxCallsPerSec: &mcps,
+	})
+	want := map[string]any{
+		"type": "mapLlm", "prompt": "Summarise: {body}", "outputField": "summary",
+		"model": "gemma3:7b", "temperature": 0.0, "maxTokens": 64, "parallelism": 8,
+		"ordering": "UNORDERED", "onFailure": "PASS_THROUGH", "maxCallsPerSec": 50,
+	}
+	if got := b.Operators()[0]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestStreamBuilder_MapLlmRejectsBlankPromptOrOutputField(t *testing.T) {
+	expectPanic(t, "prompt", func() {
+		NewStreamBuilder("").FromTopic("in").MapLlm("", MapLlmOptions{OutputField: "x"})
+	})
+	expectPanic(t, "OutputField", func() {
+		NewStreamBuilder("").FromTopic("in").MapLlm("p", MapLlmOptions{OutputField: ""})
+	})
+}
+
+func TestStreamBuilder_ExtractFullShape(t *testing.T) {
+	b := NewStreamBuilder("").FromTopic("in").Extract(ExtractOptions{
+		Instruction: "Extract intent",
+		Schema:      map[string]string{"intent": "string", "urgency": "int"},
+		Model:       "gemma3:7b",
+	})
+	op := b.Operators()[0]
+	if op["type"] != "extract" || op["instruction"] != "Extract intent" || op["model"] != "gemma3:7b" {
+		t.Fatalf("got %v", op)
+	}
+	schema := op["schema"].(map[string]any)
+	if schema["intent"] != "string" || schema["urgency"] != "int" {
+		t.Fatalf("schema: %v", schema)
+	}
+}
+
+func TestStreamBuilder_ExtractRejectsEmptySchema(t *testing.T) {
+	expectPanic(t, "Schema", func() {
+		NewStreamBuilder("").FromTopic("in").Extract(ExtractOptions{Instruction: "x"})
+	})
+}
+
+func TestStreamBuilder_McpCallFullShape(t *testing.T) {
+	par := 4
+	b := NewStreamBuilder("").FromTopic("in").McpCall("crm.lookup_customer", McpCallOptions{
+		Args:        map[string]any{"customer_id": "{customerId}"},
+		OutputField: "customer",
+		Parallelism: &par,
+		Ordering:    "UNORDERED",
+		OnFailure:   "EMIT_ERROR",
+	})
+	want := map[string]any{
+		"type": "mcpCall", "tool": "crm.lookup_customer",
+		"args":        map[string]any{"customer_id": "{customerId}"},
+		"outputField": "customer", "parallelism": 4, "ordering": "UNORDERED", "onFailure": "EMIT_ERROR",
+	}
+	if got := b.Operators()[0]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestStreamBuilder_McpCallMinimalFireAndForget(t *testing.T) {
+	b := NewStreamBuilder("").FromTopic("in").McpCall("pagerduty.create_incident")
+	want := []map[string]any{{"type": "mcpCall", "tool": "pagerduty.create_incident"}}
+	if got := b.Operators(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestStreamBuilder_McpCallRejectsBlankTool(t *testing.T) {
+	expectPanic(t, "tool", func() {
+		NewStreamBuilder("").FromTopic("in").McpCall("")
+	})
+}
+
 func TestStreamBuilder_BroadcastJoinFullShape(t *testing.T) {
 	mb := int64(10_000_000)
 	im := 30_000
@@ -803,4 +892,16 @@ func expectPanic(t *testing.T, substr string, fn func()) {
 		}
 	}()
 	fn()
+}
+
+func TestStreamBuilder_ToConnector(t *testing.T) {
+	out, _ := NewStreamBuilder("pc").FromTopic("in").Filter("x > 0").
+		ToConnector("segment", map[string]any{"segment.write.key": "wk"}).Build("")
+	nodes := out["nodes"].([]map[string]any)
+	sink := nodes[len(nodes)-1]
+	cfg := sink["config"].(map[string]any)
+	if sink["type"] != "sink" || cfg["channel"] != "segment" ||
+		cfg["inputTopic"] != "segment-sink-out" || cfg["segment.write.key"] != "wk" {
+		t.Fatalf("unexpected sink node: %v", sink)
+	}
 }
