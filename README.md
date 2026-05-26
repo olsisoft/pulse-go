@@ -10,7 +10,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/olsisoft/pulse-go"
+    "github.com/olsisoft/pulse-go/v2"
 )
 
 func main() {
@@ -38,7 +38,7 @@ func main() {
 ## Install
 
 ```bash
-go get github.com/olsisoft/pulse-go
+go get github.com/olsisoft/pulse-go/v2
 ```
 
 Requires **Go 1.22+**.
@@ -60,7 +60,7 @@ import (
     "log"
     "time"
 
-    "github.com/olsisoft/pulse-go"
+    "github.com/olsisoft/pulse-go/v2"
 )
 
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -167,7 +167,7 @@ import (
     "errors"
     "time"
 
-    "github.com/olsisoft/pulse-go"
+    "github.com/olsisoft/pulse-go/v2"
 )
 
 _, err := client.Pipelines.Get(ctx, "nope")
