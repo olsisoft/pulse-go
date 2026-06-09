@@ -905,3 +905,53 @@ func TestStreamBuilder_ToConnector(t *testing.T) {
 		t.Fatalf("unexpected sink node: %v", sink)
 	}
 }
+
+// ── B-110 Wasm ────────────────────────────────────────────────
+
+func TestStreamBuilder_WasmFullShape(t *testing.T) {
+	par := 4
+	b := NewStreamBuilder("").FromTopic("events").Wasm(WasmOptions{
+		Module:      "pii-redactor",
+		Parallelism: &par,
+		Ordering:    "UNORDERED",
+		OnFailure:   "DROP",
+	})
+	want := []map[string]any{
+		{
+			"type":        "wasm",
+			"module":      "pii-redactor",
+			"parallelism": 4,
+			"ordering":    "UNORDERED",
+			"onFailure":   "DROP",
+		},
+	}
+	if got := b.Operators(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestStreamBuilder_WasmMinimalShape(t *testing.T) {
+	b := NewStreamBuilder("").FromTopic("in").Wasm(WasmOptions{Module: "m"})
+	want := []map[string]any{{"type": "wasm", "module": "m"}}
+	if got := b.Operators(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestStreamBuilder_WasmRejectsBlankModule(t *testing.T) {
+	expectPanic(t, "Module", func() {
+		NewStreamBuilder("").FromTopic("in").Wasm(WasmOptions{Module: ""})
+	})
+}
+
+func TestStreamBuilder_WasmRejectsBadOrdering(t *testing.T) {
+	expectPanic(t, "Ordering", func() {
+		NewStreamBuilder("").FromTopic("in").Wasm(WasmOptions{Module: "m", Ordering: "NOPE"})
+	})
+}
+
+func TestStreamBuilder_WasmRejectsBadOnFailure(t *testing.T) {
+	expectPanic(t, "OnFailure", func() {
+		NewStreamBuilder("").FromTopic("in").Wasm(WasmOptions{Module: "m", OnFailure: "NOPE"})
+	})
+}
