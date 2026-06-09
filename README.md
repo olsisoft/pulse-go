@@ -137,6 +137,31 @@ cid, _ := ch.Send(ctx, map[string]any{"amount": 5000}, "tx-1")
 out, _ := ch.Recv(ctx) // out["correlationId"] == "tx-1"
 ```
 
+## Sandboxed WASM transforms
+
+Run per-event compute in any language that compiles to WebAssembly, sandboxed
+in-process on the Pulse engine (B-110) — no host syscalls, no network, no
+filesystem. Upload the module, then reference it from the streaming `Wasm`
+operator.
+
+```go
+// Upload a .wasm module (validated server-side: must export alloc/process/memory)
+client.Wasm.Upload(ctx, pulse.UploadWasmOptions{
+    Name: "pii-redactor", Path: "./redactor.wasm", Description: "strip PII"})
+
+// Transform each event with the sandboxed module
+builder.FromTopic("events").
+    Wasm(pulse.WasmOptions{Module: "pii-redactor"}).
+    ToTopic("clean")
+```
+
+**Legacy formats & protocols — the headline use case.** Compile *any* existing
+parser to `wasm32` and drop it in as a single-message transform to bring legacy
+data into the pipeline — **COBOL copybooks**, FIX, HL7, EDI X12, ASN.1, Modbus, …
+You don't rewrite the parser, you wrap it (see the `pulse-wasm-guest` guest SDK for
+the Rust/TinyGo/AssemblyScript/C operator ABI). Pair it with `MlPredict` (ONNX
+above) to parse *and* score each event in-stream, with no external service.
+
 ## Authentication
 
 Three patterns:
@@ -227,6 +252,38 @@ go test -race ./...    # ensure concurrent token rotation is safe
 ```
 
 CI runs the same on every push touching `pulse-go/` — see `.github/workflows/pulse-go.yaml`.
+
+## Automatic retry (opt-in)
+
+Off by default — one attempt per request. Enable bounded, full-jitter
+exponential-backoff retries with `WithRetry`:
+
+```go
+client, _ := pulse.NewClient(
+    pulse.WithBaseURL("http://localhost:9090"),
+    pulse.WithToken(os.Getenv("PULSE_JWT")),
+    pulse.WithRetry(pulse.RetryPolicy{MaxRetries: 3}),
+)
+```
+
+429 (rate limited) is retried for any method, honouring `Retry-After`; `OnStatus`
+5xx (default `502/503/504`) and transport errors are retried only for idempotent
+methods (GET/HEAD/PUT/DELETE) unless `RetryNonIdempotent`; terminal 4xx are never
+retried.
+
+## Local pipeline simulation (Python-only today)
+
+The streams DSL is **client-side declaration, server-side execution**:
+`Streams.Compile(builder)` builds the pipeline JSON locally (no network) and
+`Streams.Deploy(ctx, builder)` runs it on the Pulse engine. This SDK has **no
+in-process simulator** — to validate a pipeline before deploy, `Compile()` and
+inspect the JSON, or deploy to a dev Pulse.
+
+> A local `TopologyTestDriver`-style executor that runs a streams pipeline
+> in-process over sample events (`StreamBuilder.Simulate(events)`) currently
+> exists **only in the Python SDK** (`streamflow-pulse-client`). Cross-language
+> parity is tracked as **B-169** (issue #311); until then, local simulation is a
+> Python-exclusive capability.
 
 ## Roadmap
 

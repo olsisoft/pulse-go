@@ -33,10 +33,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,18 +58,26 @@ type Client struct {
 	tokenMu sync.RWMutex
 	token   string
 
+	// Opt-in retry policy (off by default — see WithRetry).
+	retryMax        int
+	retryBackoff    time.Duration
+	retryMaxBackoff time.Duration
+	retryStatuses   map[int]bool
+	retryNonIdem    bool
+
 	// Resource accessors — each one shares the same transport. Public fields
 	// (not method-based) so usage reads as `client.Pipelines.List(ctx)`,
 	// matching the AWS SDK v2 / Google Cloud Go SDK convention.
-	Auth      *AuthService
-	Pipelines *PipelinesService
-	Agents    *AgentsService
-	Templates *TemplatesService
-	Users     *UsersService
-	Events    *EventsService
-	IQ        *IQService
-	Streams   *StreamsService
+	Auth       *AuthService
+	Pipelines  *PipelinesService
+	Agents     *AgentsService
+	Templates  *TemplatesService
+	Users      *UsersService
+	Events     *EventsService
+	IQ         *IQService
+	Streams    *StreamsService
 	Models     *ModelsService
+	Wasm       *WasmService
 	Connectors *ConnectorsService
 }
 
@@ -115,6 +125,51 @@ func WithHTTPClient(h *http.Client) Option {
 	}
 }
 
+// RetryPolicy configures opt-in automatic retries. The zero value (MaxRetries 0)
+// means retries are OFF — the client makes exactly one attempt per request.
+type RetryPolicy struct {
+	MaxRetries int           // 0 = off (default)
+	Backoff    time.Duration // base backoff; default 200ms
+	MaxBackoff time.Duration // per-attempt cap; default 10s
+	OnStatus   []int         // retryable 5xx statuses; default 502, 503, 504
+	// RetryNonIdempotent, when true, also retries non-idempotent methods
+	// (POST/PATCH) on 5xx/transport. Default false → only GET/HEAD/PUT/DELETE
+	// are retried on those, so a POST create is never silently duplicated.
+	RetryNonIdempotent bool
+}
+
+// WithRetry enables opt-in, bounded, full-jitter exponential-backoff retries
+// (off by default). 429 (rate limited) is always retried for any method,
+// honouring Retry-After; OnStatus 5xx and transport errors are retried only for
+// idempotent methods unless RetryNonIdempotent is set. Terminal 4xx are never
+// retried.
+func WithRetry(p RetryPolicy) Option {
+	return func(c *Client) error {
+		if p.MaxRetries < 0 {
+			return errors.New("pulse: RetryPolicy.MaxRetries cannot be negative")
+		}
+		c.retryMax = p.MaxRetries
+		c.retryBackoff = p.Backoff
+		if c.retryBackoff <= 0 {
+			c.retryBackoff = 200 * time.Millisecond
+		}
+		c.retryMaxBackoff = p.MaxBackoff
+		if c.retryMaxBackoff <= 0 {
+			c.retryMaxBackoff = 10 * time.Second
+		}
+		statuses := p.OnStatus
+		if len(statuses) == 0 {
+			statuses = []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout}
+		}
+		c.retryStatuses = make(map[int]bool, len(statuses))
+		for _, s := range statuses {
+			c.retryStatuses[s] = true
+		}
+		c.retryNonIdem = p.RetryNonIdempotent
+		return nil
+	}
+}
+
 // NewClient constructs a Client. Options are applied in order; the first
 // non-nil error short-circuits and is returned.
 func NewClient(opts ...Option) (*Client, error) {
@@ -141,6 +196,7 @@ func NewClient(opts ...Option) (*Client, error) {
 	c.IQ = &IQService{client: c}
 	c.Streams = &StreamsService{client: c}
 	c.Models = &ModelsService{client: c}
+	c.Wasm = &WasmService{client: c}
 	c.Connectors = &ConnectorsService{client: c}
 	return c, nil
 }
@@ -166,8 +222,73 @@ func (c *Client) Version(ctx context.Context) (map[string]any, error) {
 	return c.request(ctx, http.MethodGet, "/api/pulse/version", nil, false)
 }
 
-// request is the internal HTTP execution + error-translation pipeline.
+var idempotentMethods = map[string]bool{
+	http.MethodGet: true, http.MethodHead: true, http.MethodPut: true,
+	http.MethodDelete: true, http.MethodOptions: true,
+}
+
+// request runs doOnce under the opt-in retry policy. With retries off
+// (retryMax == 0, the default) it makes exactly one attempt — identical to the
+// pre-retry behaviour.
 func (c *Client) request(ctx context.Context, method, path string, body any, authenticated bool) (map[string]any, error) {
+	attempt := 0
+	for {
+		res, err := c.doOnce(ctx, method, path, body, authenticated)
+		if err == nil || attempt >= c.retryMax {
+			return res, err
+		}
+		retryable, wait := c.retryDecision(method, err, attempt)
+		if !retryable {
+			return res, err
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		}
+		attempt++
+	}
+}
+
+// retryDecision reports whether err is retryable for method at this attempt and
+// how long to wait. 429 → any method (honour Retry-After); OnStatus 5xx +
+// transport → idempotent methods only (unless RetryNonIdempotent); else not.
+func (c *Client) retryDecision(method string, err error, attempt int) (bool, time.Duration) {
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		if rle.RetryAfterSeconds > 0 {
+			return true, time.Duration(rle.RetryAfterSeconds) * time.Second
+		}
+		return true, c.backoffDelay(attempt)
+	}
+	if !idempotentMethods[strings.ToUpper(method)] && !c.retryNonIdem {
+		return false, 0
+	}
+	var ae *APIError
+	if errors.As(err, &ae) && c.retryStatuses[ae.StatusCode] {
+		return true, c.backoffDelay(attempt)
+	}
+	var te *transportError
+	if errors.As(err, &te) {
+		return true, c.backoffDelay(attempt)
+	}
+	return false, 0
+}
+
+// backoffDelay returns full-jitter exponential backoff:
+// uniform[0, min(MaxBackoff, Backoff*2^attempt)].
+func (c *Client) backoffDelay(attempt int) time.Duration {
+	ceiling := c.retryBackoff << uint(attempt) // base * 2^attempt
+	if ceiling <= 0 || ceiling > c.retryMaxBackoff {
+		ceiling = c.retryMaxBackoff
+	}
+	return time.Duration(rand.Int63n(int64(ceiling) + 1))
+}
+
+// doOnce is the internal HTTP execution + error-translation pipeline (one attempt).
+func (c *Client) doOnce(ctx context.Context, method, path string, body any, authenticated bool) (map[string]any, error) {
 	var reqBody io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -199,7 +320,7 @@ func (c *Client) request(ctx context.Context, method, path string, body any, aut
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("pulse: HTTP transport failure on %s %s: %w", method, path, err)
+		return nil, &transportError{method: method, path: path, err: err}
 	}
 	defer resp.Body.Close()
 

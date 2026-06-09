@@ -318,8 +318,208 @@ func (s *ModelsService) Delete(ctx context.Context, name string) error {
 }
 
 // ---------------------------------------------------------------------------
+// WasmService — client.Wasm. B-110 sandboxed WASM module registry.
+// ---------------------------------------------------------------------------
+
+// WasmService groups the B-110 sandboxed WASM module registry endpoints.
+//
+// Upload WebAssembly modules that the streaming Wasm operator runs over events,
+// sandboxed in pure-Java Chicory on the engine (no host syscalls). Modules are
+// org-scoped; Upload / Delete require the ADMIN role.
+//
+//	_, err := client.Wasm.Upload(ctx, pulse.UploadWasmOptions{
+//	    Name: "pii-redactor",
+//	    Path: "./redactor.wasm",
+//	})
+type WasmService struct {
+	client *Client
+}
+
+// UploadWasmOptions — options for WasmService.Upload. Name is required, and
+// exactly one of Path or Data must be set. Description is optional.
+type UploadWasmOptions struct {
+	Name        string // module name referenced by Wasm(Module: ...)
+	Path        string // filesystem path to the .wasm file
+	Data        []byte // raw module bytes (alternative to Path)
+	Description string // optional human-readable description
+}
+
+// Upload uploads (or replaces) a module (POST /api/pulse/wasm-modules).
+//
+// Supply the module either by file Path or raw Data bytes (exactly one). The
+// module is validated server-side (must parse, import no host functions, export
+// alloc/process/memory) before persisting. Replacing an existing name hot-swaps
+// the module with no agent restart.
+//
+// Sent as multipart/form-data: file part "module" + text fields "name" and
+// (when set) "description". Returns the persisted module metadata (name,
+// sha256, version, …).
+func (s *WasmService) Upload(ctx context.Context, options UploadWasmOptions) (map[string]any, error) {
+	if strings.TrimSpace(options.Name) == "" {
+		return nil, errors.New("pulse: Wasm.Upload — Name must be a non-empty string")
+	}
+	if (options.Path == "") == (options.Data == nil) {
+		return nil, errors.New("pulse: Wasm.Upload — provide exactly one of Path or Data")
+	}
+
+	var blob []byte
+	var filename string
+	if options.Path != "" {
+		b, err := os.ReadFile(options.Path)
+		if err != nil {
+			return nil, fmt.Errorf("pulse: Wasm.Upload — failed to read module file %q: %w", options.Path, err)
+		}
+		blob = b
+		filename = filepath.Base(options.Path)
+	} else {
+		blob = options.Data
+		filename = options.Name + ".wasm"
+	}
+	if len(blob) == 0 {
+		return nil, errors.New("pulse: Wasm.Upload — module bytes are empty")
+	}
+	if err := validateWasmModule(blob); err != nil {
+		return nil, fmt.Errorf("pulse: Wasm.Upload — %w", err)
+	}
+
+	form := map[string]string{"name": options.Name}
+	if options.Description != "" {
+		form["description"] = options.Description
+	}
+	return s.client.requestMultipart(ctx, "/api/pulse/wasm-modules", "module", filename, blob, form)
+}
+
+// List returns the modules registered for the caller's org
+// (GET /api/pulse/wasm-modules).
+func (s *WasmService) List(ctx context.Context) ([]map[string]any, error) {
+	result, err := s.client.request(ctx, http.MethodGet, "/api/pulse/wasm-modules", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	return unwrapList(result["modules"]), nil
+}
+
+// Get returns metadata for one module by name
+// (GET /api/pulse/wasm-modules/{name}).
+func (s *WasmService) Get(ctx context.Context, name string) (map[string]any, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, errors.New("pulse: Wasm.Get — name must be a non-empty string")
+	}
+	return s.client.request(ctx, http.MethodGet, "/api/pulse/wasm-modules/"+encodePathSegment(name), nil, true)
+}
+
+// Delete removes a module by name (DELETE /api/pulse/wasm-modules/{name}). ADMIN.
+func (s *WasmService) Delete(ctx context.Context, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("pulse: Wasm.Delete — name must be a non-empty string")
+	}
+	_, err := s.client.request(ctx, http.MethodDelete, "/api/pulse/wasm-modules/"+encodePathSegment(name), nil, true)
+	return err
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// validateWasmModule inspects (does NOT execute) raw WASM module bytes and
+// mirrors the server-side ChicoryWasmRunner.validateModule contract, so a bad
+// module is rejected locally with a clear error instead of producing a cryptic
+// server 400 / runtime trap. It checks the magic + version header, rejects any
+// module that imports host functions (it must be a pure sandbox), and requires
+// the alloc, process and memory exports the Wasm operator depends on.
+func validateWasmModule(b []byte) error {
+	if len(b) < 8 {
+		return errors.New("not a WASM module: too short")
+	}
+	if b[0] != 0x00 || b[1] != 'a' || b[2] != 's' || b[3] != 'm' ||
+		b[4] != 0x01 || b[5] != 0x00 || b[6] != 0x00 || b[7] != 0x00 {
+		return errors.New("not a WASM module (bad magic/version)")
+	}
+
+	exports := map[string]bool{}
+	pos := 8
+	for pos < len(b) {
+		id := b[pos]
+		pos++
+		size, next, err := readUleb128(b, pos)
+		if err != nil {
+			return err
+		}
+		payloadStart := next
+		payloadEnd := payloadStart + int(size)
+		if payloadEnd > len(b) || payloadEnd < payloadStart {
+			return errors.New("malformed WASM module")
+		}
+
+		switch id {
+		case 2: // import section
+			count, _, err := readUleb128(b, payloadStart)
+			if err != nil {
+				return err
+			}
+			if count > 0 {
+				return errors.New("WASM module imports host functions; it must be a pure sandbox (build with no WASI/host imports)")
+			}
+		case 7: // export section
+			count, p, err := readUleb128(b, payloadStart)
+			if err != nil {
+				return err
+			}
+			for i := uint64(0); i < count; i++ {
+				nameLen, np, err := readUleb128(b, p)
+				if err != nil {
+					return err
+				}
+				nameEnd := np + int(nameLen)
+				if nameEnd > payloadEnd || nameEnd < np {
+					return errors.New("malformed WASM module")
+				}
+				name := string(b[np:nameEnd])
+				p = nameEnd
+				// 1 kind byte + uleb128 index.
+				if p >= payloadEnd {
+					return errors.New("malformed WASM module")
+				}
+				p++ // kind
+				_, ip, err := readUleb128(b, p)
+				if err != nil {
+					return err
+				}
+				p = ip
+				exports[name] = true
+			}
+		}
+
+		pos = payloadEnd
+	}
+
+	if !exports["alloc"] || !exports["process"] || !exports["memory"] {
+		return errors.New("WASM module must export alloc, process and memory")
+	}
+	return nil
+}
+
+// readUleb128 decodes an unsigned LEB128 integer starting at offset i, returning
+// the value and the offset just past the encoded bytes. It bounds-checks the
+// slice and returns "malformed WASM module" on overrun.
+func readUleb128(b []byte, i int) (value uint64, next int, err error) {
+	var shift uint
+	for {
+		if i >= len(b) {
+			return 0, 0, errors.New("malformed WASM module")
+		}
+		if shift >= 64 {
+			return 0, 0, errors.New("malformed WASM module")
+		}
+		c := b[i]
+		i++
+		value |= uint64(c&0x7f) << shift
+		if c&0x80 == 0 {
+			return value, i, nil
+		}
+		shift += 7
+	}
+}
 
 // unwrapList safely extracts a []map[string]any from the JSON-decoded value.
 // Returns an empty slice on missing / malformed envelopes — never nil — so
