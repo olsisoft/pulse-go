@@ -59,6 +59,21 @@ type RateLimitError struct {
 	RetryAfterSeconds int
 }
 
+// transportError wraps a connection-level failure (DNS / connect / read) so the
+// opt-in retry layer can distinguish it from a deterministic encode/parse error.
+// It Unwraps to the underlying net error, so existing errors.Is/As checks on the
+// transport cause keep working.
+type transportError struct {
+	method, path string
+	err          error
+}
+
+func (e *transportError) Error() string {
+	return fmt.Sprintf("pulse: HTTP transport failure on %s %s: %v", e.method, e.path, e.err)
+}
+
+func (e *transportError) Unwrap() error { return e.err }
+
 // ErrNoToken is returned by request() when the caller invokes an authenticated
 // endpoint without setting a token first. It's wrapped in an AuthError so the
 // shape is consistent with server-side 401s.

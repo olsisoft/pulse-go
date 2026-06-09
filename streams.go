@@ -287,6 +287,15 @@ type MlPredictOptions struct {
 	OnFailure   string // "EMIT_ERROR" | "DROP" | "PASS_THROUGH" | "" (omit)
 }
 
+// WasmOptions — B-110 options for StreamBuilder.Wasm. Module is required.
+// Pointer fields are optional (nil = omit).
+type WasmOptions struct {
+	Module      string
+	Parallelism *int
+	Ordering    string // "PRESERVE_INPUT" | "UNORDERED" | "" (omit)
+	OnFailure   string // "EMIT_ERROR" | "DROP" | "PASS_THROUGH" | "" (omit)
+}
+
 // ---------------------------------------------------------------------------
 // StreamBuilder — fluent operator-chain → pipeline-JSON compiler.
 // ---------------------------------------------------------------------------
@@ -664,6 +673,34 @@ func (b *StreamBuilder) MlPredict(options MlPredictOptions) *StreamBuilder {
 		"inputFields": inputFields,
 		"outputField": options.OutputField,
 	}
+	if options.Parallelism != nil {
+		op["parallelism"] = *options.Parallelism
+	}
+	if options.Ordering != "" {
+		op["ordering"] = options.Ordering
+	}
+	if options.OnFailure != "" {
+		op["onFailure"] = options.OnFailure
+	}
+	b.ops = append(b.ops, op)
+	return b
+}
+
+// Wasm — B-110: transform each event with a sandboxed WebAssembly module.
+//
+// Runs an uploaded module in-process on the Pulse engine, sandboxed in
+// pure-Java Chicory (no host syscalls, no network, no filesystem). The module
+// receives the event payload, transforms it, and returns the new payload —
+// arbitrary per-event compute in any language that compiles to WASM.
+//
+// Upload the module first with client.Wasm.Upload(...).
+func (b *StreamBuilder) Wasm(options WasmOptions) *StreamBuilder {
+	requireNonBlank("Module", options.Module)
+	if options.Ordering != "" && options.Ordering != "PRESERVE_INPUT" && options.Ordering != "UNORDERED" {
+		panic(fmt.Sprintf("Wasm: Ordering must be PRESERVE_INPUT or UNORDERED, got %q", options.Ordering))
+	}
+	checkFailure("Wasm", options.OnFailure)
+	op := map[string]any{"type": "wasm", "module": options.Module}
 	if options.Parallelism != nil {
 		op["parallelism"] = *options.Parallelism
 	}

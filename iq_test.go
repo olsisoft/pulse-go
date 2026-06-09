@@ -243,7 +243,7 @@ func TestIQ_ScanPassesThroughRangeParams(t *testing.T) {
 func TestIQ_Scan404AgentNotQueryableRaises(t *testing.T) {
 	endpoint, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, 404, map[string]any{
-			"error": "Agent has no queryable state",
+			"error":   "Agent has no queryable state",
 			"agentId": "a1", "reason": "non-streaming or stopped",
 		})
 	})

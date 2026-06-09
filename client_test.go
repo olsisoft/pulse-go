@@ -2,12 +2,17 @@ package pulse
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -822,5 +827,313 @@ func TestErrors_ContextCancellationCancelsRequest(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Wasm — B-110 sandboxed WASM module registry (client.Wasm)
+// ---------------------------------------------------------------------------
+
+// parseWasmUpload reads a multipart/form-data POST body, returning the "module"
+// file part bytes plus the text fields. Mirrors the server-side contract the
+// upload endpoint enforces (file field "module" + fields "name"/"description").
+func parseWasmUpload(t *testing.T, r *http.Request) (fileBytes []byte, fields map[string]string) {
+	t.Helper()
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		t.Fatalf("expected multipart/form-data, got %q (%v)", mediaType, err)
+	}
+	mr := multipart.NewReader(r.Body, params["boundary"])
+	fields = map[string]string{}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read multipart part: %v", err)
+		}
+		data, err := io.ReadAll(part)
+		if err != nil {
+			t.Fatalf("read part body: %v", err)
+		}
+		if part.FormName() == "module" {
+			fileBytes = data
+		} else {
+			fields[part.FormName()] = string(data)
+		}
+	}
+	return fileBytes, fields
+}
+
+func TestWasm_UploadFromBytesSendsMultipart(t *testing.T) {
+	var gotFile []byte
+	var gotFields map[string]string
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/pulse/wasm-modules" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		gotFile, gotFields = parseWasmUpload(t, r)
+		writeJSON(t, w, http.StatusCreated, map[string]any{"name": "redactor", "version": 1, "sizeBytes": 9})
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+
+	wasmBytes := validWasmModuleBytes()
+	meta, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{
+		Name: "redactor", Data: wasmBytes, Description: "pii",
+	})
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if meta["name"] != "redactor" {
+		t.Fatalf("expected name redactor, got %v", meta["name"])
+	}
+	if string(gotFile) != string(wasmBytes) {
+		t.Fatalf("file part mismatch: got %x", gotFile)
+	}
+	if gotFields["name"] != "redactor" {
+		t.Fatalf("expected name field redactor, got %q", gotFields["name"])
+	}
+	if gotFields["description"] != "pii" {
+		t.Fatalf("expected description pii, got %q", gotFields["description"])
+	}
+}
+
+func TestWasm_UploadFromPathReadsFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mod.wasm")
+	wasmBytes := validWasmModuleBytes()
+	if err := os.WriteFile(path, wasmBytes, 0o600); err != nil {
+		t.Fatalf("write temp wasm: %v", err)
+	}
+	var gotFile []byte
+	var gotFields map[string]string
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotFile, gotFields = parseWasmUpload(t, r)
+		writeJSON(t, w, http.StatusCreated, map[string]any{"name": "fromfile"})
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+
+	if _, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "fromfile", Path: path}); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if string(gotFile) != string(wasmBytes) {
+		t.Fatalf("file part mismatch: got %x", gotFile)
+	}
+	if _, ok := gotFields["description"]; ok {
+		t.Fatalf("description must be omitted when unset, got %q", gotFields["description"])
+	}
+}
+
+func TestWasm_UploadRejectsBlankName(t *testing.T) {
+	c := newClient(t, "http://unused", WithToken("fake.jwt"))
+	if _, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "  ", Data: []byte{0x01}}); err == nil ||
+		!strings.Contains(err.Error(), "non-empty") {
+		t.Fatalf("expected non-empty-name error, got %v", err)
+	}
+}
+
+func TestWasm_UploadRequiresExactlyOneSource(t *testing.T) {
+	c := newClient(t, "http://unused", WithToken("fake.jwt"))
+	if _, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "m"}); err == nil ||
+		!strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected exactly-one error (neither), got %v", err)
+	}
+	if _, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "m", Path: "x", Data: []byte{0x01}}); err == nil ||
+		!strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected exactly-one error (both), got %v", err)
+	}
+}
+
+func TestWasm_UploadRejectsEmptyBytes(t *testing.T) {
+	// A non-nil but zero-length Data passes the exactly-one-of guard (Data !=
+	// nil), so the dedicated empty-bytes guard must fire.
+	c := newClient(t, "http://unused", WithToken("fake.jwt"))
+	if _, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "m", Data: []byte{}}); err == nil ||
+		!strings.Contains(err.Error(), "empty") {
+		t.Fatalf("expected empty-bytes error, got %v", err)
+	}
+}
+
+func TestWasm_ListUnwrapsEnvelope(t *testing.T) {
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/pulse/wasm-modules" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		writeJSON(t, w, http.StatusOK, map[string]any{"modules": []any{map[string]any{"name": "redactor"}}})
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+	mods, err := c.Wasm.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(mods) != 1 || mods[0]["name"] != "redactor" {
+		t.Fatalf("expected one module redactor, got %v", mods)
+	}
+}
+
+func TestWasm_ListEmptyOnMissingEnvelope(t *testing.T) {
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusOK, map[string]any{})
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+	mods, err := c.Wasm.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if mods == nil || len(mods) != 0 {
+		t.Fatalf("expected empty non-nil slice, got %v", mods)
+	}
+}
+
+func TestWasm_GetReturnsOneModule(t *testing.T) {
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/pulse/wasm-modules/redactor" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		writeJSON(t, w, http.StatusOK, map[string]any{"name": "redactor", "version": 2})
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+	mod, err := c.Wasm.Get(context.Background(), "redactor")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if v, _ := mod["version"].(float64); v != 2 {
+		t.Fatalf("expected version 2, got %v", mod["version"])
+	}
+}
+
+func TestWasm_GetRejectsBlankName(t *testing.T) {
+	c := newClient(t, "http://unused", WithToken("fake.jwt"))
+	if _, err := c.Wasm.Get(context.Background(), "  "); err == nil ||
+		!strings.Contains(err.Error(), "non-empty") {
+		t.Fatalf("expected non-empty-name error, got %v", err)
+	}
+}
+
+func TestWasm_DeleteReturnsNil(t *testing.T) {
+	var hit bool
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/api/pulse/wasm-modules/redactor" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		hit = true
+		writeJSON(t, w, http.StatusOK, map[string]any{"deleted": "redactor"})
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+	if err := c.Wasm.Delete(context.Background(), "redactor"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if !hit {
+		t.Fatal("expected DELETE to reach server")
+	}
+}
+
+func TestWasm_DeleteRejectsBlankName(t *testing.T) {
+	c := newClient(t, "http://unused", WithToken("fake.jwt"))
+	if err := c.Wasm.Delete(context.Background(), ""); err == nil ||
+		!strings.Contains(err.Error(), "non-empty") {
+		t.Fatalf("expected non-empty-name error, got %v", err)
+	}
+}
+
+func TestWasm_UploadWithoutTokenRaisesAuthBeforeHTTP(t *testing.T) {
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server must not be reached without a token")
+	})
+	defer stop()
+	c := newClient(t, url) // no token
+	_, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "m", Data: validWasmModuleBytes()})
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected AuthError, got %v", err)
+	}
+}
+
+// hexToBytes decodes a space-separated hex string into bytes for WASM fixtures.
+func hexToBytes(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(strings.ReplaceAll(s, " ", ""))
+	if err != nil {
+		t.Fatalf("decode hex fixture: %v", err)
+	}
+	return b
+}
+
+// validWasmModuleBytes returns a minimal module that passes validateWasmModule:
+// magic+version, an export section listing alloc, process and memory, no imports.
+// Export section: id 0x07, size 0x1c (28), count 0x03, then three entries
+// (alloc/process/memory), each name(uleb len+bytes) + kind byte + uleb index.
+func validWasmModuleBytes() []byte {
+	return []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+		0x07, 0x1c, 0x03,
+		0x05, 0x61, 0x6c, 0x6c, 0x6f, 0x63, 0x00, 0x00,
+		0x07, 0x70, 0x72, 0x6f, 0x63, 0x65, 0x73, 0x73, 0x00, 0x00,
+		0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00,
+	}
+}
+
+func TestValidateWasmModule_AcceptsValid(t *testing.T) {
+	if err := validateWasmModule(validWasmModuleBytes()); err != nil {
+		t.Fatalf("expected valid module to pass, got %v", err)
+	}
+}
+
+func TestValidateWasmModule_RejectsImports(t *testing.T) {
+	mod := hexToBytes(t, "00 61 73 6d 01 00 00 00 02 09 01 03 65 6e 76 01 66 00 00 "+
+		"07 1c 01 05 61 6c 6c 6f 63 00 00 07 70 72 6f 63 65 73 73 00 00 06 6d 65 6d 6f 72 79 02 00")
+	err := validateWasmModule(mod)
+	if err == nil || !strings.Contains(err.Error(), "imports host functions") {
+		t.Fatalf("expected imports-host-functions error, got %v", err)
+	}
+}
+
+func TestValidateWasmModule_RejectsEmpty(t *testing.T) {
+	if err := validateWasmModule(nil); err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected too-short error, got %v", err)
+	}
+	if err := validateWasmModule([]byte{0x00, 0x61, 0x73}); err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected too-short error, got %v", err)
+	}
+}
+
+func TestValidateWasmModule_RejectsBadMagic(t *testing.T) {
+	bad := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x00, 0x00, 0x00}
+	if err := validateWasmModule(bad); err == nil || !strings.Contains(err.Error(), "bad magic/version") {
+		t.Fatalf("expected bad-magic error, got %v", err)
+	}
+	// correct magic, wrong version
+	badVer := []byte{0x00, 0x61, 0x73, 0x6d, 0x02, 0x00, 0x00, 0x00}
+	if err := validateWasmModule(badVer); err == nil || !strings.Contains(err.Error(), "bad magic/version") {
+		t.Fatalf("expected bad-version error, got %v", err)
+	}
+}
+
+func TestValidateWasmModule_RejectsMissingExport(t *testing.T) {
+	// Export section lists only alloc — process and memory absent.
+	mod := hexToBytes(t, "00 61 73 6d 01 00 00 00 07 09 01 05 61 6c 6c 6f 63 00 00")
+	err := validateWasmModule(mod)
+	if err == nil || !strings.Contains(err.Error(), "must export alloc, process and memory") {
+		t.Fatalf("expected missing-export error, got %v", err)
+	}
+}
+
+func TestWasm_UploadRejectsInvalidModuleWithoutHTTP(t *testing.T) {
+	url, stop := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server must not be reached for an invalid module")
+	})
+	defer stop()
+	c := newClient(t, url, WithToken("fake.jwt"))
+	// bad magic — fails validation before the HTTP request
+	_, err := c.Wasm.Upload(context.Background(), UploadWasmOptions{Name: "m", Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}})
+	if err == nil || !strings.Contains(err.Error(), "bad magic/version") {
+		t.Fatalf("expected bad-magic error, got %v", err)
 	}
 }
