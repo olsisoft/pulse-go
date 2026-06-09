@@ -44,7 +44,7 @@ import (
 )
 
 const (
-	userAgent      = "pulse-client-go/2.6.1"
+	userAgent      = "pulse-client-go/2.7.5"
 	defaultTimeout = 30 * time.Second
 )
 

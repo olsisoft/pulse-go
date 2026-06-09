@@ -133,7 +133,7 @@ func TestAuth_LoginCachesToken(t *testing.T) {
 			t.Fatalf("body missing username: %s", body)
 		}
 		writeJSON(t, w, 200, map[string]any{
-			"token":        "new.jwt.token",
+			"accessToken":        "new.jwt.token",
 			"refreshToken": "refresh.token",
 			"activeOrg":    map[string]string{"id": "org1", "name": "Acme"},
 		})

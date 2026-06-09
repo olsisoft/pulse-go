@@ -70,6 +70,10 @@ func (s *AuthService) SwitchOrg(ctx context.Context, orgID string) (map[string]a
 }
 
 func cacheToken(c *Client, response map[string]any) {
+	if v, ok := response["accessToken"].(string); ok && v != "" {
+		c.SetToken(v)
+		return
+	}
 	if v, ok := response["token"].(string); ok && v != "" {
 		c.SetToken(v)
 	}
