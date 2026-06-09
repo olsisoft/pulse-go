@@ -101,7 +101,7 @@ newPipeline, _ := client.Pipelines.Create(ctx, map[string]any{
 log.Println("created:", newPipeline["id"])
 ```
 
-## Supported surfaces (v2.6.0)
+## Supported surfaces (v2.7.x)
 
 | Resource | Methods | Notes |
 |---|---|---|
@@ -163,6 +163,31 @@ the Rust/TinyGo/AssemblyScript/C operator ABI). Pair it with `MlPredict` (ONNX
 above) to parse *and* score each event in-stream, with no external service.
 
 ## Authentication
+
+### Where credentials come from
+
+The SDK authenticates as a **Pulse user** — there are no separate API keys to
+provision. A username + password (or a JWT minted from them) is all you need,
+and they live in **your own Pulse instance**, not on streamflowmesh.io.
+
+1. **First run → bootstrap admin.** The very first account is created either by
+   the first-run screen of the Pulse web/desktop app, or by a single
+   *unauthenticated* `POST /api/auth/register` with a `{"username","password"}`
+   body **while no user exists yet**. That first user is granted **ADMIN**. As
+   soon as any user exists, `/api/auth/register` locks down and requires an admin
+   JWT — so the open bootstrap can only ever mint the very first account.
+2. **Additional users.** An admin creates more accounts from **Settings → Users**
+   in the Pulse UI (or an admin-authenticated `register` call). Give each CI job
+   or service integration its own dedicated user rather than sharing the admin.
+3. **Exchange for a token.** `login(username, password)` returns a short-lived
+   **access JWT** (~1 h TTL) plus a **refresh token**; the client caches the
+   access token automatically. In CI, either call `login` at startup, or pass a
+   pre-minted JWT (pattern 2 below) and refresh it before it expires.
+
+`baseUrl` points at *your* Pulse server — `http://localhost:9090` for a local
+`pulse --headless` or desktop install, or your deployed Pulse URL.
+
+### Passing the token to the client
 
 Three patterns:
 
