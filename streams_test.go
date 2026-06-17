@@ -235,6 +235,40 @@ func TestStreamBuilder_WindowWithOutputTopicAndTrigger(t *testing.T) {
 	}
 }
 
+func TestStreamBuilder_WithStreamConfigMergesIntoAgentNode(t *testing.T) {
+	out, _ := NewStreamBuilder("p").
+		FromTopic("in").
+		WithStreamConfig(map[string]any{"eventTime": false}).
+		KeyBy("k").
+		Window(WindowsTumbling("10s"), WindowOptions{Aggregations: map[string]string{"cnt": AggsCount()}}).
+		Filter("cnt > 3").
+		Build("")
+	nodes := out["nodes"].([]map[string]any)
+	ac := nodes[1]["config"].(map[string]any)
+	if ac["eventTime"] != false {
+		t.Fatalf("eventTime should be false on the agent node, got %v", ac["eventTime"])
+	}
+	// Structural keys must survive the merge.
+	if ac["engine"] != "streaming" || ac["inputTopic"] != "in" {
+		t.Fatalf("structural keys clobbered: %v", ac)
+	}
+}
+
+func TestStreamBuilder_WithStreamConfigNeverClobbersStructuralKeys(t *testing.T) {
+	out, _ := NewStreamBuilder("p").
+		FromTopic("in").
+		WithStreamConfig(map[string]any{"engine": "hijack", "operators": "nope", "inputTopic": "evil"}).
+		Filter("x > 0").
+		Build("")
+	ac := out["nodes"].([]map[string]any)[1]["config"].(map[string]any)
+	if ac["engine"] != "streaming" || ac["inputTopic"] != "in" {
+		t.Fatalf("structural keys must not be overridable via WithStreamConfig: %v", ac)
+	}
+	if _, ok := ac["operators"].([]map[string]any); !ok {
+		t.Fatalf("operators must stay the operator slice, got %T", ac["operators"])
+	}
+}
+
 func TestStreamBuilder_WindowRejectsBlankSpecString(t *testing.T) {
 	expectPanic(t, "spec", func() {
 		NewStreamBuilder("").FromTopic("in").WindowFromString("")
@@ -528,7 +562,7 @@ func TestStreamBuilder_BuildMinimalPipeline(t *testing.T) {
 		t.Fatalf("wrong node types: %v / %v", nodes[0]["type"], nodes[1]["type"])
 	}
 	srcConfig := nodes[0]["config"].(map[string]any)
-	if srcConfig["engine"] != "kafka" || srcConfig["inputTopic"] != "in" {
+	if srcConfig["engine"] != "streamflow" || srcConfig["inputTopic"] != "in" {
 		t.Fatalf("src config: %v", srcConfig)
 	}
 	ac := nodes[1]["config"].(map[string]any)

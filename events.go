@@ -98,7 +98,23 @@ func (s *EventsService) Stream(ctx context.Context) (<-chan map[string]any, <-ch
 		req.Header.Set("Cache-Control", "no-cache")
 		req.Header.Set("User-Agent", userAgent)
 
-		resp, err := s.client.http.Do(req)
+		// SSE is a long-lived stream. The shared client's unary Timeout
+		// (http.Client.Timeout bounds the WHOLE request, including reading
+		// the body) would abort the stream after Timeout seconds — surfacing
+		// as context-deadline-exceeded every Timeout seconds and dropping any
+		// events published during the reconnect gap. Use a client with no
+		// overall Timeout for the stream; its lifecycle is bounded by ctx
+		// instead. Preserve the configured Transport so connection pooling
+		// and any custom RoundTripper (WithHTTPClient) still apply.
+		streamClient := s.client.http
+		if streamClient.Timeout != 0 {
+			streamClient = &http.Client{
+				Transport:     s.client.http.Transport,
+				CheckRedirect: s.client.http.CheckRedirect,
+				Jar:           s.client.http.Jar,
+			}
+		}
+		resp, err := streamClient.Do(req)
 		if err != nil {
 			// Context-cancellation surfaces as context.Canceled / context.DeadlineExceeded
 			errCh <- err

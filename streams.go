@@ -174,7 +174,7 @@ func AggsDistinctCount(field string) string {
 
 // FromTopicOptions — options for StreamBuilder.FromTopic.
 type FromTopicOptions struct {
-	SourceEngine string         // default "kafka"
+	SourceEngine string         // default "streamflow" (native mesh; set to "kafka" for the Kafka connector)
 	SourceConfig map[string]any // extra config merged into the source node config
 	Label        string         // display label for the source node
 }
@@ -320,6 +320,7 @@ type StreamBuilder struct {
 	sinkChannel  string
 	sinkConfig   map[string]any
 	sinkLabel    string
+	streamConfig map[string]any
 	ops          []map[string]any
 }
 
@@ -329,6 +330,7 @@ func NewStreamBuilder(name string) *StreamBuilder {
 	b := &StreamBuilder{
 		sourceConfig: map[string]any{},
 		sinkConfig:   map[string]any{},
+		streamConfig: map[string]any{},
 		ops:          []map[string]any{},
 	}
 	if name != "" {
@@ -353,7 +355,11 @@ func (b *StreamBuilder) FromTopic(topic string, options ...FromTopicOptions) *St
 	if opts.SourceEngine != "" {
 		b.sourceEngine = opts.SourceEngine
 	} else {
-		b.sourceEngine = "kafka"
+		// StreamFlow's native event mesh is the default source — NOT Kafka. The
+		// engine reads the topic over the native protocol (embedded or remote
+		// cluster); Kafka is just one optional connector. Pass SourceEngine
+		// explicitly to read from a real Kafka connector instead.
+		b.sourceEngine = "streamflow"
 	}
 	b.sourceConfig = copyMap(opts.SourceConfig)
 	b.sourceLabel = opts.Label
@@ -824,6 +830,29 @@ func (b *StreamBuilder) WithAgentLabel(label string) *StreamBuilder {
 	return b
 }
 
+// WithStreamConfig merges extra keys into the streaming agent node's config
+// block — runtime knobs the engine reads off the agent config rather than off
+// an operator. The canonical use is windowing time-semantics:
+//
+//	b.WithStreamConfig(map[string]any{"eventTime": false})
+//
+// runs the pipeline's windows in processing-time. In processing-time mode the
+// engine arms a wall-clock eviction timer per window, so a window flushes at
+// its end even if no further event arrives to advance the watermark — the
+// idle-flush a burst-then-silence alert needs. The default (eventTime unset /
+// true) keeps event-time semantics, where a window only closes once a later
+// event pushes the watermark past its end. Keys merge over previous calls;
+// nil/empty is a no-op.
+func (b *StreamBuilder) WithStreamConfig(cfg map[string]any) *StreamBuilder {
+	if b.streamConfig == nil {
+		b.streamConfig = map[string]any{}
+	}
+	for k, v := range cfg {
+		b.streamConfig[k] = v
+	}
+	return b
+}
+
 // ------------------------------------------------------------------
 // Compilation
 // ------------------------------------------------------------------
@@ -896,6 +925,15 @@ func (b *StreamBuilder) Build(overrideName string) (map[string]any, error) {
 	}
 	if b.outputTopic != "" {
 		agentConfig["outputTopic"] = b.outputTopic
+	}
+	// Extra agent-level runtime config (e.g. {"eventTime": false} for
+	// processing-time windows). Merged last but never clobbers the structural
+	// keys above.
+	for k, v := range b.streamConfig {
+		if k == "engine" || k == "inputTopic" || k == "operators" || k == "outputTopic" {
+			continue
+		}
+		agentConfig[k] = v
 	}
 	agentLabel := b.agentLabel
 	if agentLabel == "" {
