@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // EventsReplayOptions — the time window + cap for Events.Replay. B-113.
@@ -83,8 +85,20 @@ func (s *EventsService) Stream(ctx context.Context) (<-chan map[string]any, <-ch
 			return
 		}
 
+		// Idle-read watchdog context: the server writes a keep-alive comment every
+		// ~15s, so a healthy stream is NEVER silent for long. Without a read bound,
+		// a half-open TCP (Pulse restarted, container network churn) blocks the
+		// scanner FOREVER with no error — the consumer looks connected while
+		// receiving nothing, and the reconnect loop never fires (2026-08-03: the
+		// insights read-model starved exactly this way; the Java native consumer
+		// had the same hang class and got SO_TIMEOUT for it). 60s of total silence
+		// cancels the request, which surfaces as a read error → the caller's
+		// reconnect loop takes over.
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		defer cancelStream()
+
 		req, err := http.NewRequestWithContext(
-			ctx,
+			streamCtx,
 			http.MethodGet,
 			s.client.baseURL+"/api/pulse/events/stream",
 			nil,
@@ -137,9 +151,37 @@ func (s *EventsService) Stream(ctx context.Context) (<-chan map[string]any, <-ch
 		// silently truncate.
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+		// Arm the idle watchdog: every received line (data, comment keep-alive,
+		// blank) counts as activity. 60s with none = dead connection → cancel.
+		// B-017 wave 1 (audit C#F6): the watchdog must measure READ starvation
+		// only. This goroutine also performs the (blocking) channel send to the
+		// consumer — a slow handler stops the Scan loop without the socket being
+		// dead, and cancelling then would kill a healthy connection AND lose the
+		// events published during the reconnect gap (SSE has no offsets). While
+		// blocked on the send, inSend suppresses the watchdog.
+		var lastActivity atomic.Int64
+		var inSend atomic.Bool
+		lastActivity.Store(time.Now().UnixMilli())
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-streamCtx.Done():
+					return
+				case <-ticker.C:
+					if !inSend.Load() && time.Now().UnixMilli()-lastActivity.Load() > 60_000 {
+						cancelStream()
+						return
+					}
+				}
+			}
+		}()
+
 		var dataLines []string
 		for scanner.Scan() {
 			line := scanner.Text()
+			lastActivity.Store(time.Now().UnixMilli())
 
 			if line == "" {
 				// Event boundary — assemble + dispatch
@@ -151,11 +193,14 @@ func (s *EventsService) Stream(ctx context.Context) (<-chan map[string]any, <-ch
 						// Non-JSON payload — surface as {data: ...}
 						event = map[string]any{"data": payload}
 					}
+					inSend.Store(true)
 					select {
 					case events <- event:
 					case <-ctx.Done():
 						return
 					}
+					inSend.Store(false)
+					lastActivity.Store(time.Now().UnixMilli())
 				}
 				continue
 			}
