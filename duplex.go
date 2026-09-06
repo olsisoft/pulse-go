@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -101,14 +102,20 @@ func (c *Client) Duplex(ctx context.Context, agentID string) (*DuplexChannel, er
 // dialDuplex performs the WebSocket handshake + reads the opening frame. Split
 // out so tests can target an explicit ws:// URL via DeriveWSURL.
 func (c *Client) dialDuplex(ctx context.Context, wsURL string) (*DuplexChannel, error) {
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	// B-017 wave 4 (silent-failure audit C#F17): callers routinely pass a
+	// long-lived ctx — without internal bounds, a half-open socket froze the
+	// dial/handshake forever (the same hang class the SSE stream got its idle
+	// watchdog for). Bound the handshake explicitly.
+	dialCtx, cancelDial := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelDial()
+	conn, _, err := websocket.Dial(dialCtx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("pulse: duplex WebSocket dial failed for %s: %w", wsURL, err)
 	}
 
 	// The server sends a 'connected' frame first (or 'error' + close for an
 	// unknown agent / disabled duplex). Surface the error eagerly.
-	_, data, err := conn.Read(ctx)
+	_, data, err := conn.Read(dialCtx)
 	if err != nil {
 		conn.CloseNow()
 		return nil, fmt.Errorf("pulse: duplex handshake read failed for %s: %w", wsURL, err)
@@ -178,7 +185,13 @@ func (ch *DuplexChannel) Recv(ctx context.Context) (map[string]any, error) {
 		return nil, errors.New("pulse: duplex channel is closed")
 	}
 	for {
-		_, data, err := ch.conn.Read(ctx)
+		// B-017 wave 4 (audit C#F17): bound every frame read — a synchronous
+		// decision agent (fraud/pricing) must fail fast against a half-open
+		// socket, never wedge the calling request path forever. 120s covers the
+		// slowest legitimate agent turnaround by a wide margin.
+		readCtx, cancelRead := context.WithTimeout(ctx, 120*time.Second)
+		_, data, err := ch.conn.Read(readCtx)
+		cancelRead()
 		if err != nil {
 			return nil, fmt.Errorf("pulse: duplex recv failed: %w", err)
 		}

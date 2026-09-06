@@ -79,6 +79,8 @@ type Client struct {
 	Models     *ModelsService
 	Wasm       *WasmService
 	Connectors *ConnectorsService
+	Pvsc       *PvscService
+	Evals      *EvalsService
 }
 
 // Option configures a Client at construction time.
@@ -198,6 +200,8 @@ func NewClient(opts ...Option) (*Client, error) {
 	c.Models = &ModelsService{client: c}
 	c.Wasm = &WasmService{client: c}
 	c.Connectors = &ConnectorsService{client: c}
+	c.Pvsc = &PvscService{client: c}
+	c.Evals = &EvalsService{client: c}
 	return c, nil
 }
 
