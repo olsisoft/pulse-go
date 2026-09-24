@@ -39,7 +39,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME}"
           GOPROXY=https://proxy.golang.org \
-            go list -m "github.com/${GITHUB_REPOSITORY}@${version}" || \
+            go list -m "github.com/${GITHUB_REPOSITORY}/v2@${version}" || \
             echo "::warning::proxy warmup non-fatal; the proxy will pick up the tag within ~10 min"
 
       - name: Create GitHub Release
@@ -47,4 +47,4 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            Install: `go get github.com/${{ github.repository }}@${{ github.ref_name }}`
+            Install: `go get github.com/${{ github.repository }}/v2@${{ github.ref_name }}`
