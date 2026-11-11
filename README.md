@@ -1,6 +1,6 @@
 # pulse-go — Go SDK for StreamFlow Pulse
 
-Official Go client for [Pulse](https://github.com/olsisoft/pulse-go) — the AI Agent Platform. Targets **Go 1.22+**, **zero external dependencies** (stdlib only: `net/http`, `encoding/json`).
+Official Go client for [Pulse](https://github.com/olsisoft/pulse) — the AI Agent Platform. Targets **Go 1.22+**, **zero external dependencies** (stdlib only: `net/http`, `encoding/json`).
 
 ```go
 package main
@@ -49,7 +49,7 @@ Requires **Go 1.22+**.
 - **Idiomatic Go** — `ctx context.Context` on every call, `errors.As` for typed errors, options-pattern constructor, public field accessors (`client.Pipelines.List(ctx)` matches the AWS SDK v2 / Google Cloud Go SDK convention).
 - **Safe for concurrent use** — a single `*pulse.Client` can be shared across an entire app; the embedded `http.Client` pools connections.
 - **Sibling parity** — same surface + naming as the Python (`pulse-py`), JavaScript (`@olsisoft/pulse-client`), and Java (`com.streamflow:pulse-client`) SDKs.
-- **Spec-aligned** — every method corresponds 1:1 to an endpoint in the [Pulse OpenAPI 3.1 spec](../streamflow-pulse/src/main/resources/openapi/openapi.yaml). Drift caught at PR time by the in-tree spec invariant tests (B-103).
+- **Spec-aligned** — every method corresponds 1:1 to an endpoint in the [Pulse OpenAPI 3.1 spec](https://github.com/olsisoft/pulse/blob/main/streamflow-pulse/src/main/resources/openapi/openapi.yaml). Drift caught at PR time by the in-tree spec invariant tests (B-103).
 
 ## Quick start
 
@@ -118,7 +118,7 @@ Full ~112-endpoint surface documented in Swagger UI at `<pulse-server>/api-docs`
 
 Score events with an uploaded ONNX model in-process (B-112), and open a
 bidirectional duplex channel for synchronous decisions (B-114). Full guide:
-[ML inference & duplex](https://github.com/olsisoft/pulse-go/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+[ML inference & duplex](https://github.com/olsisoft/pulse/blob/main/streamflow-pulse/src/main/resources/developer-hub/sdk-reference.md).
 
 ```go
 // Upload + score with an ONNX model (no model-server hop)
@@ -315,10 +315,18 @@ inspect the JSON, or deploy to a dev Pulse.
 - **v2.5.x** — current sync API, 5 core resources, `Version()`.
 - **v2.6.x** — expanded resource coverage: backups, schedules, credentials, settings, approvals, chat.
 - **v3.0** — event-stream consumer over channels: `events := client.Events.Stream(ctx); for ev := range events { ... }` consuming `/api/pulse/events/stream` (SSE).
-- **B-098 satellite** — once `olsisoft/pulse-go` exists as its own repo, this in-tree code lifts out wholesale. `go get` will switch to the satellite; in-tree continues to mirror for one release cycle.
+- **Historical B-098 satellite (LEGACY_COMPATIBILITY)** — once `olsisoft/pulse-go` exists as its own repo, this in-tree code lifts out wholesale. `go get` will switch to the satellite; in-tree continues to mirror for one release cycle.
 
 Track progress in [`docs/STREAMFLOW-BACKLOG.md`](../docs/STREAMFLOW-BACKLOG.md) under item **B-098**.
 
 ## License
 
 Apache 2.0 — same as the parent Pulse repository.
+
+## Canonical source and local qualification
+
+Canonical implementation: [olsisoft/pulse](https://github.com/olsisoft/pulse),
+not historical StreamFlow source. Existing public package identities, release
+URLs and protocol endpoints remain unchanged. Published installations/channels are
+LEGACY_COMPATIBILITY; PE1 qualifies only explicit local/private candidate artifacts.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
